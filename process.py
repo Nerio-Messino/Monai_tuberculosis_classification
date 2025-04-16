@@ -35,6 +35,11 @@ from monai.transforms import (
     RandRotate,
     RandZoom,
     ScaleIntensity,
+    RandGaussianNoise,
+    RandAdjustContrast,
+    RandShiftIntensity
+
+
 )
 from monai.utils import set_determinism
 
@@ -50,6 +55,70 @@ if not os.path.exists(root_dir):
 print(f"Directorio del dataset: {root_dir}")
 
 set_determinism(seed=0) 
+
+class CustomDataset(torch.utils.data.Dataset):
+    def __init__(self, image_files, labels_binary, transforms=None):
+        self.image_files = image_files
+        self.labels_binary = labels_binary
+        self.transforms = transforms
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, index):
+        img_path = self.image_files[index]
+        img = img_path
+
+        if self.transforms:
+            img = self.transforms(img)
+
+        binary_label = torch.tensor(self.labels_binary[index], dtype=torch.float32)
+        return img, binary_label
+
+# RED NEURONAL 
+# Definimos la arquitectura del modelo
+class BinaryClassifierDenseNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = DenseNet201(spatial_dims=2, in_channels=3, out_channels=512)
+        self.fc_binary = nn.Linear(512, 1)
+
+    def forward(self, x):
+        x = self.backbone(x)
+        binary_output = self.fc_binary(x)
+        return binary_output
+
+#APLICAR TRANSFORMACIONES EN IMAGENES 
+val_transforms = Compose(
+    [
+        LoadImage(image_only=True),
+        EnsureChannelFirst(),
+        Resize((256, 256)),  # Asegurar tamaño uniforme
+        EnsureType(),
+        Lambda(lambda x: x if x.shape[0] == 3 else x.repeat(3, 1, 1)),  # Asegurar 3 canales
+        ScaleIntensity(),  # Normalizar valores
+    ]
+)
+
+train_transforms = Compose(
+    [
+        LoadImage(image_only=True),
+        EnsureChannelFirst(),
+        Resize((256, 256)),
+        EnsureType(),
+        Lambda(lambda x: x if x.shape[0] == 3 else x.repeat(3, 1, 1)),
+        ScaleIntensity(),
+
+        # ⬇️ Aumentos anatómicamente consistentes
+        RandRotate(range_x=np.pi / 12, prob=0.5, keep_size=True),  # Ya estaba, perfecto
+        RandFlip(spatial_axis=1, prob=0.5),  # Flip vertical (eje 1) - bien para rayos
+        RandZoom(min_zoom=0.9, max_zoom=1.1, prob=0.5),
+
+        RandGaussianNoise(prob=0.2),  # Añade un poco de ruido
+        RandAdjustContrast(prob=0.3, gamma=(0.9, 1.1)),  # Ligeras variaciones de contraste
+        RandShiftIntensity(offsets=0.1, prob=0.3),  # Cambios leves en intensidad
+    ]
+)
 
 # OBTENER EL CSV
 # Ruta al archivo CSV
@@ -106,320 +175,247 @@ def get_labels(image_path):
     binary_label = 1 if tb_type in ["possible", "confirmed", "probable"] and minority == 1 else 0
     return binary_label
 
-
-# Proporciones de datos
-# Aqui en un futuro vamos a usar 5-fold cross validation , no vamos a dividir los datos por fracciones
-val_frac = 0.1
-test_frac = 0.1
-length = len(image_files_list)
-
-# Mezclar índices aleatoriamente
-indices = np.arange(length)
-np.random.shuffle(indices)
-
-# Dividir en test, validación y entrenamiento
-test_split = int(test_frac * length)
-val_split = int(val_frac * length) + test_split
-
-test_indices = indices[:test_split]
-val_indices = indices[test_split:val_split]
-train_indices = indices[val_split:]
-
-# Obtener solo etiquetas binarias
-train_y_binary = [get_labels(image_files_list[i]) for i in train_indices]
-val_y_binary = [get_labels(image_files_list[i]) for i in val_indices]
-test_y_binary = [get_labels(image_files_list[i]) for i in test_indices]
-
-
-# Imprimir tamaños correctos
-print(f"Training count: {len(train_y_binary)}, Validation count: {len(val_y_binary)}, Test count: {len(test_y_binary)}")
-
-#APLICAR TRANSFORMACIONES EN IMAGENES 
-
-train_transforms = Compose(
-    [
-        LoadImage(image_only=True),  # Carga la imagen desde la ruta
-        EnsureChannelFirst(),  # Asegura que tenga el formato (C, H, W)
-        Resize((256,256)),
-        EnsureType(),  # Convierte a Tensor si aún no lo es
-        Lambda(lambda x: x if x.shape[0] == 3 else x.repeat(3, 1, 1)),  # Si la imagen no es de 1 canal, fuerza a 1 canal  
-        ScaleIntensity(),  # Normaliza valores entre 0 y 1
-        RandRotate(range_x=np.pi / 12, prob=0.5, keep_size=True),  # Rotación aleatoria
-        #RandFlip(spatial_axis=1, prob=0.5),  # Flip horizontal
-        RandZoom(min_zoom=0.9, max_zoom=1.1, prob=0.5),  # Zoom aleatorio
-    ]
-)
-
-val_transforms = Compose(
-    [
-        LoadImage(image_only=True),
-        EnsureChannelFirst(),
-        Resize((256, 256)),  # Asegurar tamaño uniforme
-        EnsureType(),
-        Lambda(lambda x: x if x.shape[0] == 3 else x.repeat(3, 1, 1)),  # Asegurar 3 canales
-        ScaleIntensity(),  # Normalizar valores
-    ]
-)
-
-y_pred_trans = Compose([Activations(softmax=True)])  # Softmax para predicciones
-y_trans = Compose([AsDiscrete(to_onehot=2)])  # Convertir etiquetas a one-hot para 2 clases
-
-
-#AJUSTAMOS LOS VALORES DEL DATASET 
-
-class CustomDataset(torch.utils.data.Dataset):
-    def __init__(self, image_files, labels_binary, transforms=None):
-        self.image_files = image_files
-        self.labels_binary = labels_binary
-        self.transforms = transforms
-
-    def __len__(self):
-        return len(self.image_files)
-
-    def __getitem__(self, index):
-        img_path = self.image_files[index]
-        img = img_path
-
-        if self.transforms:
-            img = self.transforms(img)
-
-        binary_label = torch.tensor(self.labels_binary[index], dtype=torch.float32)
-        return img, binary_label
-
-
-# 📌 Obtener rutas de imágenes separadas
-train_image_files = [image_files_list[i] for i in train_indices]
-val_image_files = [image_files_list[i] for i in val_indices]
-test_image_files = [image_files_list[i] for i in test_indices]
-
-# 📌 Dataset de entrenamiento, validación y test (solo binario)
-train_ds = CustomDataset(train_image_files, train_y_binary, transforms=train_transforms)
-val_ds = CustomDataset(val_image_files, val_y_binary, transforms=val_transforms)
-test_ds = CustomDataset(test_image_files, test_y_binary, transforms=val_transforms)
-
-# 📌 Dataloaders
-train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4)
-val_loader = DataLoader(val_ds, batch_size=32, num_workers=4)
-test_loader = DataLoader(test_ds, batch_size=32, num_workers=4)
-
-# 🔍 Verificar formas del loader de validación
-val_img, val_binary_label = next(iter(val_loader))
-print("Imagen shape (validación):", val_img.shape)
-print("Etiqueta binaria (validación):", val_binary_label)
-
-# 🔍 Verificar formas del loader de entrenamiento
-sample_img, sample_binary_label = next(iter(train_loader))
-print("Imagen shape:", sample_img.shape)
-print("Etiqueta binaria:", sample_binary_label)
-
-
-# RED NEURONAL 
-# Definimos la arquitectura del modelo
-class BinaryClassifierDenseNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.backbone = DenseNet201(spatial_dims=2, in_channels=3, out_channels=512)
-        self.fc_binary = nn.Linear(512, 1)
-
-    def forward(self, x):
-        x = self.backbone(x)
-        binary_output = self.fc_binary(x)
-        return binary_output
-
 # ESTABLECEMOS EL MODELO Y LAS DISTINTAS MÉTRICAS
 # Seleccionamos el dispositivo (GPU si está disponible, sino CPU)
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Solo se verá la GPU con índice 0
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 print(f"Usando el dispositivo: {device}")
+# Proporciones de datos
+# Aqui en un futuro vamos a usar 5-fold cross validation , no vamos a dividir los datos por fracciones
+df = df[df["fold_cv"].notna()]
+df["fold_cv"] = df["fold_cv"].astype(int)
+folds = df["fold_cv"].unique()
+folds.sort()
+all_fold_metrics = []
+fold_results = []
+num_folds = 5
+folds_data = []
 
-# Inicializamos el modelo y lo movemos al dispositivo
-model = BinaryClassifierDenseNet().to(device)
+for fold in folds:
+    # Test: fold actual
+    test_indices = df[df["fold_cv"] == fold].index.tolist()
+    
+    # Validación: siguiente fold (en ciclo)
+    val_fold = (fold + 1) % num_folds
+    val_indices = df[df["fold_cv"] == val_fold].index.tolist()
+    
+    # Entrenamiento: el resto
+    train_indices = df[~df["fold_cv"].isin([fold, val_fold])].index.tolist()
+    
+    folds_data.append((train_indices, val_indices, test_indices))
 
-# Definimos las funciones de pérdida
-loss_binary = torch.nn.BCEWithLogitsLoss()  # Para la clasificación binaria
-loss_categorical = torch.nn.CrossEntropyLoss()  # Para la clasificación categórica
+# 🔁 Bucle de entrenamiento por fold
+for fold, (train_indices, val_indices, test_indices) in enumerate(folds_data):
+    print(f"\n🚀 Fold {fold + 1}/{num_folds}")
+    
+    # Preparar datos específicos del fold
+    train_image_files = [image_files_list[i] for i in train_indices]
+    val_image_files = [image_files_list[i] for i in val_indices]
+    test_image_files = [image_files_list[i] for i in test_indices]
 
-# Optimizador
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+    # Aplica la función get_labels a cada imagen
+    binary_labels = np.array([get_labels(img_path) for img_path in image_files_list])
 
-# Parámetros de entrenamiento
-max_epochs = 250
-val_interval = 1  # Cada cuántas épocas evaluar
-auc_metric = ROCAUCMetric()  # Métrica para la clasificación binaria
+    
+    train_y_binary = binary_labels[train_indices]
+    val_y_binary = binary_labels[val_indices]
+    test_y_binary = binary_labels[test_indices]
 
-# Variables para almacenar métricas y pérdidas
-best_metric = -1
-best_metric_epoch = -1
-epoch_loss_values = []
-metric_values = []
+    # Datasets y dataloaders
+    train_ds = CustomDataset(train_image_files, train_y_binary, transforms=train_transforms)
+    val_ds = CustomDataset(val_image_files, val_y_binary, transforms=val_transforms)
+    test_ds = CustomDataset(test_image_files, test_y_binary, transforms=val_transforms)
 
-# Para visualizar en TensorBoard
-writer = SummaryWriter()
-train_loss_values = []
-val_loss_values = []
-val_auc_values = []
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_ds, batch_size=32, num_workers=4)
+    test_loader = DataLoader(test_ds, batch_size=32, num_workers=4)
 
-for epoch in range(max_epochs):
-    print(f"Epoch {epoch + 1}/{max_epochs}")
-    model.train()
-    epoch_loss = 0
+    # 🧠 Modelo, pérdida, optimizador
+    model = BinaryClassifierDenseNet().to(device)
+    loss_binary = torch.nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5, weight_decay=1e-4)
+    auc_metric = ROCAUCMetric()
 
-    for batch_data in train_loader:
-        images, binary_labels = batch_data
-        images, binary_labels = images.to(device), binary_labels.to(device)
+    # 🎯 Parámetros
+    max_epochs = 350
+    val_interval = 1
+    best_metric = -1
+    best_metric_epoch = -1
 
-        optimizer.zero_grad()
+    # 📊 Para curvas
+    train_loss_values = []
+    val_loss_values = []
+    val_auc_values = []
 
-        # 🔹 Forward pass
-        binary_output = model(images)
+    writer = SummaryWriter()
 
-        # 🔹 Calcular pérdida binaria
-        loss_b = loss_binary(binary_output.squeeze(), binary_labels)
+    # 🔁 Entrenamiento por epoch
+    for epoch in range(max_epochs):
+        print(f"Epoch {epoch + 1}/{max_epochs}")
+        model.train()
+        epoch_loss = 0
 
-        # 🔹 Backward pass y optimización
-        loss_b.backward()
-        optimizer.step()
+        for batch_data in train_loader:
+            images, binary_labels = batch_data
+            images, binary_labels = images.to(device), binary_labels.to(device)
 
-        epoch_loss += loss_b.item()
+            optimizer.zero_grad()
+            binary_output = model(images)
+            loss_b = loss_binary(binary_output.squeeze(), binary_labels)
+            loss_b.backward()
+            optimizer.step()
+            epoch_loss += loss_b.item()
 
-    # 🔹 Guardar pérdida promedio de la época
-    epoch_loss /= len(train_loader)
-    train_loss_values.append(epoch_loss)
-    print(f" Pérdida de entrenamiento: {epoch_loss:.4f}")
+        epoch_loss /= len(train_loader)
+        train_loss_values.append(epoch_loss)
+        print(f" Pérdida de entrenamiento: {epoch_loss:.4f}")
 
-    if (epoch + 1) % val_interval == 0:
-        model.eval()
-        val_loss = 0
-        all_binary_preds = []
-        all_binary_labels = []
+        if (epoch + 1) % val_interval == 0:
+            model.eval()
+            val_loss = 0
+            all_binary_preds = []
+            all_binary_labels = []
 
-        with torch.no_grad():
-            for val_data in val_loader:
-                images, binary_labels = val_data
-                images, binary_labels = images.to(device), binary_labels.to(device)
+            with torch.no_grad():
+                for val_data in val_loader:
+                    images, binary_labels = val_data
+                    images, binary_labels = images.to(device), binary_labels.to(device)
 
-                binary_output = model(images)
+                    binary_output = model(images)
+                    loss_b = loss_binary(binary_output.squeeze(), binary_labels)
+                    val_loss += loss_b.item()
 
-                # 🔹 Calcular pérdida binaria
-                loss_b = loss_binary(binary_output.squeeze(), binary_labels)
-                val_loss += loss_b.item()
+                    binary_probs = torch.sigmoid(binary_output).cpu().numpy()
+                    all_binary_preds.extend(binary_probs)
+                    all_binary_labels.extend(binary_labels.cpu().numpy())
 
-                # 🔹 Guardar predicciones para evaluar AUC
-                binary_probs = torch.sigmoid(binary_output).cpu().numpy()
-                all_binary_preds.extend(binary_probs)
-                all_binary_labels.extend(binary_labels.cpu().numpy())
+            val_loss /= len(val_loader)
+            val_loss_values.append(val_loss)
+            print(f" Pérdida de validación: {val_loss:.4f}")
 
-        val_loss /= len(val_loader)
-        val_loss_values.append(val_loss)
-        print(f" Pérdida de validación: {val_loss:.4f}")
+            all_binary_preds = torch.tensor(np.array(all_binary_preds), dtype=torch.float32)
+            all_binary_labels = torch.tensor(np.array(all_binary_labels), dtype=torch.float32)
 
-        all_binary_preds = torch.tensor(np.array(all_binary_preds), dtype=torch.float32)
-        all_binary_labels = torch.tensor(np.array(all_binary_labels), dtype=torch.float32)
+            auc_metric(y_pred=all_binary_preds, y=all_binary_labels)
+            auc_value = auc_metric.aggregate()
+            auc_metric.reset()
+            val_auc_values.append(auc_value)
 
-        # Calcular AUC
-        auc_metric(y_pred=all_binary_preds, y=all_binary_labels)
-        auc_value = auc_metric.aggregate()
-        auc_metric.reset()
-        val_auc_values.append(auc_value)
+            print(f" AUC en validación: {auc_value:.4f}")
 
-        print(f" AUC en validación: {auc_value:.4f}")
+            if auc_value > best_metric:
+                best_metric = auc_value
+                best_metric_epoch = epoch + 1
+                torch.save(model.state_dict(), f"best_model_fold{fold}.pth")
+                print(" Modelo guardado con mejor AUC!")
 
-        if auc_value > best_metric:
-            best_metric = auc_value
-            best_metric_epoch = epoch + 1
-            torch.save(model.state_dict(), "best_model.pth")
-            print(" Modelo guardado con mejor AUC!")
+    print(f"🏁 Fold {fold + 1} finalizado - Mejor AUC: {best_metric:.4f} (época {best_metric_epoch})")
+    writer.close()
 
-print(f" Mejor AUC: {best_metric:.4f} en la época {best_metric_epoch}")
-writer.close()
-#EVALUAR EL MODELO 
+    # 📈 Guardar curva de entrenamiento
+    epochs_range = list(range(1, len(train_loss_values) + 1))
+    val_epochs_range = list(range(val_interval, max_epochs + 1, val_interval))
 
-# 🔹 Evaluación final del modelo en el conjunto de validación
-model.eval()
-all_binary_preds = []
-all_binary_labels = []
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs_range, train_loss_values, label='Train Loss')
+    plt.plot(val_epochs_range, val_loss_values, label='Val Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title(f'Loss Curve - Fold {fold}')
+    plt.legend()
 
-with torch.no_grad():
-    for val_data in val_loader:
-        images, binary_labels = val_data  # Solo nos interesa la etiqueta binaria
-        images = images.to(device)
+    plt.subplot(1, 2, 2)
+    plt.plot(val_epochs_range, val_auc_values, label='Validation AUC', color='green')
+    plt.xlabel('Epochs')
+    plt.ylabel('AUC')
+    plt.title(f'Validation AUC Curve - Fold {fold}')
+    plt.legend()
 
-        binary_output = model(images)  # Solo usamos la salida binaria
-        binary_probs = torch.sigmoid(binary_output).cpu().numpy()
-        binary_preds = (binary_probs > 0.7).astype(int)  # Convertimos probabilidades a etiquetas (0 o 1)
+    plt.tight_layout()
+    plt.savefig(f"training_curves_fold{fold}.png")
+    print(f"📊 Curvas guardadas como training_curves_fold{fold}.png")
 
-        all_binary_preds.extend(binary_preds)
-        all_binary_labels.extend(binary_labels.cpu().numpy())
-
-# 🔹 Calcular métricas
-accuracy = accuracy_score(all_binary_labels, all_binary_preds)
-precision = precision_score(all_binary_labels, all_binary_preds)
-recall = recall_score(all_binary_labels, all_binary_preds)
-f1 = f1_score(all_binary_labels, all_binary_preds)
-conf_matrix = confusion_matrix(all_binary_labels, all_binary_preds)
-
-# 🔹 Mostrar resultados
-print(f"🔍 **Evaluación del Modelo** 🔍")
-print(f"Accuracy: {accuracy:.4f}")
-print(f"Precision: {precision:.4f}")
-print(f"Recall: {recall:.4f}")
-print(f"F1 Score: {f1:.4f}")
-print("Matriz de Confusión:")
-print(conf_matrix)
-
-
-# 🎨 GRAFICAR CURVAS
-epochs_range = list(range(1, len(train_loss_values) + 1))
-val_epochs_range = list(range(val_interval, max_epochs + 1, val_interval))
-
-plt.figure(figsize=(12, 5))
-
-plt.subplot(1, 2, 1)
-plt.plot(epochs_range, train_loss_values, label='Train Loss')
-plt.plot(val_epochs_range, val_loss_values, label='Val Loss')
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
-plt.title('Loss Curve')
-plt.legend()
-
-plt.subplot(1, 2, 2)
-plt.plot(val_epochs_range, val_auc_values, label='Validation AUC', color='green')
-plt.xlabel('Epochs')
-plt.ylabel('AUC')
-plt.title('Validation AUC Curve')
-plt.legend()
-
-plt.tight_layout()
-plt.savefig("training_curves.png")
-print("📈 Curvas de entrenamiento guardadas en 'training_curves.png'")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-def predict_tuberculosis(model, image):
-    """
-    Usa la salida del modelo para determinar si hay tuberculosis.
-    """
+    # ✅ Evaluación final del mejor modelo
+    model.load_state_dict(torch.load(f"best_model_fold{fold}.pth"))
     model.eval()
+    all_binary_preds = []
+    all_binary_labels = []
+
     with torch.no_grad():
-        # Obtener predicciones
-        binary_pred, categorical_pred = model(image)
+        for val_data in val_loader:
+            images, binary_labels = val_data
+            images = images.to(device)
 
-        # Convertir a probabilidades
-        binary_prob = torch.sigmoid(binary_pred)  # [0, 1]
-        categorical_prob = torch.softmax(categorical_pred, dim=1)  # [3 clases]
+            binary_output = model(images)
+            binary_probs = torch.sigmoid(binary_output).cpu().numpy()
+            binary_preds = (binary_probs > 0.7).astype(int)
 
-        # Decidir si es tuberculosis
-        has_tuberculosis = (binary_prob > 0.5) and (categorical_prob.argmax() > 0)
-        return has_tuberculosis
+            all_binary_preds.extend(binary_preds)
+            all_binary_labels.extend(binary_labels.cpu().numpy())
+
+    accuracy = accuracy_score(all_binary_labels, all_binary_preds)
+    precision = precision_score(all_binary_labels, all_binary_preds)
+    recall = recall_score(all_binary_labels, all_binary_preds)
+    f1 = f1_score(all_binary_labels, all_binary_preds)
+    conf_matrix = confusion_matrix(all_binary_labels, all_binary_preds)
+
+    print(f"📍 Resultados evaluación final - Fold {fold}")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    print("Matriz de Confusión:")
+    print(conf_matrix)
+
+    fold_results.append({
+        "fold": int(fold),
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "best_auc": best_metric,
+    })
+
+# 🧾 Resumen general tras todos los folds
+print("\n📋 Resultados por fold:")
+for res in fold_results:
+    print(f"Fold {res['fold']}: Acc={res['accuracy']:.4f}, Prec={res['precision']:.4f}, Rec={res['recall']:.4f}, F1={res['f1']:.4f}, AUC={res['best_auc']:.4f}")
+
+# Promedio general
+avg_metrics = {
+    "accuracy": np.mean([res["accuracy"] for res in fold_results]),
+    "precision": np.mean([res["precision"] for res in fold_results]),
+    "recall": np.mean([res["recall"] for res in fold_results]),
+    "f1": np.mean([res["f1"] for res in fold_results]),
+    "auc": np.mean([res["best_auc"] for res in fold_results])
+}
+
+print("\n📈 Promedio final en todos los folds:")
+for metric, value in avg_metrics.items():
+    print(f"{metric.capitalize()}: {value:.4f}")
+
+# 📊 Convertir resultados por fold en DataFrame
+results_df = pd.DataFrame(fold_results)
+
+# 📌 Redondear todo a 4 decimales
+results_df = results_df.round(4)
+
+# ✅ Calcular media y desviación estándar
+mean_row = results_df.mean().round(4)
+std_row = results_df.std().round(4)
+
+# 🧮 Crear fila final con "media ± std"
+summary_row = [f"{mean:.4f} ± {std:.4f}" for mean, std in zip(mean_row, std_row)]
+
+# Añadir fila con etiqueta y combinar todo
+summary_df = pd.DataFrame([summary_row], columns=results_df.columns, index=["Mean ± Std"])
+final_df = pd.concat([results_df, summary_df])
+
+# 💾 Guardar a CSV (opcional)
+final_df.to_csv("cv_metrics_summary.csv", index=False)
+
+# 📋 Mostrar la tabla bonita
+print("\n📊 Tabla de métricas por fold con media ± desviación estándar:\n")
+print(final_df.to_markdown())
