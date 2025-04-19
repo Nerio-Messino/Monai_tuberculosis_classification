@@ -378,6 +378,7 @@ for fold, (train_indices, val_indices, test_indices) in enumerate(folds_data):
         "best_auc": best_metric,
     })
 
+
 # 🧾 Resumen general tras todos los folds
 print("\n📋 Resultados por fold:")
 for res in fold_results:
@@ -419,3 +420,81 @@ final_df.to_csv("cv_metrics_summary.csv", index=False)
 # 📋 Mostrar la tabla bonita
 print("\n📊 Tabla de métricas por fold con media ± desviación estándar:\n")
 print(final_df.to_markdown())
+
+print("\n🧠 Iniciando inferencia con ensemble en test...")
+
+# 1️⃣ Obtener todos los modelos guardados
+ensemble_models = []
+for fold in range(num_folds):
+    model = BinaryClassifierDenseNet().to(device)
+    model.load_state_dict(torch.load(f"best_model_fold{fold}.pth"))
+    model.eval()
+    ensemble_models.append(model)
+
+# 2️⃣ Preparar conjunto de test completo
+# Aquí recogemos todos los índices que han sido usados como test en cada fold
+all_test_indices = [idx for _, _, test_idx in folds_data for idx in test_idx]
+unique_test_indices = sorted(list(set(all_test_indices)))
+
+test_image_files = [image_files_list[i] for i in unique_test_indices]
+test_y_binary = binary_labels[unique_test_indices]
+
+test_ds = CustomDataset(test_image_files, test_y_binary, transforms=val_transforms)
+test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=4)
+
+# 3️⃣ Inferencia con ensemble (soft voting)
+all_preds = []
+all_labels = []
+
+with torch.no_grad():
+    for images, labels in test_loader:
+        images = images.to(device)
+        labels = labels.cpu().numpy()
+        
+        # Predicciones de todos los modelos
+        fold_probs = []
+        for model in ensemble_models:
+            outputs = model(images)
+            probs = torch.sigmoid(outputs).cpu().numpy()
+            fold_probs.append(probs)
+        
+        # Media de probabilidades (soft voting)
+        mean_probs = np.mean(fold_probs, axis=0)
+        final_preds = (mean_probs > 0.7).astype(int)  # Umbral
+        
+        all_preds.extend(final_preds)
+        all_labels.extend(labels)
+
+# 4️⃣ Métricas finales
+ensemble_accuracy = accuracy_score(all_labels, all_preds)
+ensemble_precision = precision_score(all_labels, all_preds)
+ensemble_recall = recall_score(all_labels, all_preds)
+ensemble_f1 = f1_score(all_labels, all_preds)
+conf_matrix = confusion_matrix(all_labels, all_preds)
+
+print("\n✅ Resultados del Ensemble en Test:")
+print(f"Accuracy: {accuracy:.4f}")
+print(f"Precision: {precision:.4f}")
+print(f"Recall: {recall:.4f}")
+print(f"F1 Score: {f1:.4f}")
+print("Matriz de Confusión:")
+print(conf_matrix)
+
+# 📌 Guardar resultados del ensemble en test
+ensemble_results = {
+    "fold": "Ensemble-Test",
+    "accuracy": ensemble_accuracy,
+    "precision": ensemble_precision,
+    "recall": ensemble_recall,
+    "f1": ensemble_f1,
+}
+
+# 📌 Añadirlo al DataFrame final
+final_df_with_ensemble = pd.concat([results_df, pd.DataFrame([ensemble_results]), summary_df])
+
+# 💾 Guardar todo a un nuevo CSV
+final_df_with_ensemble.to_csv("final_results_with_ensemble.csv", index=False)
+
+# 📋 Mostrar la tabla completa
+print("\n🧾 Tabla completa (CV + Ensemble Test):\n")
+print(final_df_with_ensemble.to_markdown())
