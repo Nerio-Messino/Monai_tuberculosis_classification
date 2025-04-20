@@ -175,14 +175,17 @@ def get_labels(image_path):
     binary_label = 1 if tb_type in ["possible", "confirmed", "probable"] and minority == 1 else 0
     return binary_label
 
-# ESTABLECEMOS EL MODELO Y LAS DISTINTAS MÉTRICAS
-# Seleccionamos el dispositivo (GPU si está disponible, sino CPU)
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Solo se verá la GPU con índice 0
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 🔢 Selecciona el índice de la GPU del sistema que quieres usar (0 o 1, según nvitop/nvidia-smi)
+gpu_id = 0  # ← CAMBIA ESTE NÚMERO para usar la GPU 0 o 1 del sistema
 
-print(f"Usando el dispositivo: {device}")
+# 🧠 Restringe la visibilidad solo a esa GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+# 🖥️ PyTorch solo verá 1 GPU, que será 'cuda:0'
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(f"Usando el dispositivo: {device} (GPU real: {gpu_id})")
+
 # Proporciones de datos
-# Aqui en un futuro vamos a usar 5-fold cross validation , no vamos a dividir los datos por fracciones
 df = df[df["fold_cv"].notna()]
 df["fold_cv"] = df["fold_cv"].astype(int)
 folds = df["fold_cv"].unique()
@@ -194,16 +197,20 @@ folds_data = []
 
 for fold in folds:
     # Test: fold actual
-    test_indices = df[df["fold_cv"] == fold].index.tolist()
-    
+    test_indices = sorted(df[df["fold_cv"] == fold].index.tolist())  # Ordena los índices
     # Validación: siguiente fold (en ciclo)
     val_fold = (fold + 1) % num_folds
-    val_indices = df[df["fold_cv"] == val_fold].index.tolist()
-    
+    val_indices = sorted(df[df["fold_cv"] == val_fold].index.tolist())  # Ordena los índices
     # Entrenamiento: el resto
-    train_indices = df[~df["fold_cv"].isin([fold, val_fold])].index.tolist()
+    train_indices = sorted(df[~df["fold_cv"].isin([fold, val_fold])].index.tolist())  # Ordena los índices
     
     folds_data.append((train_indices, val_indices, test_indices))
+
+print(f"Longitud de image_files_list: {len(image_files_list)}")  # Verifica que tenga 877 elementos
+
+# ✅ Al principio, nómbrala diferente
+binary_labels_full = np.array([get_labels(img_path) for img_path in image_files_list])
+
 
 # 🔁 Bucle de entrenamiento por fold
 for fold, (train_indices, val_indices, test_indices) in enumerate(folds_data):
@@ -214,9 +221,7 @@ for fold, (train_indices, val_indices, test_indices) in enumerate(folds_data):
     val_image_files = [image_files_list[i] for i in val_indices]
     test_image_files = [image_files_list[i] for i in test_indices]
 
-    # Aplica la función get_labels a cada imagen
     binary_labels = np.array([get_labels(img_path) for img_path in image_files_list])
-
     
     train_y_binary = binary_labels[train_indices]
     val_y_binary = binary_labels[val_indices]
@@ -238,7 +243,7 @@ for fold, (train_indices, val_indices, test_indices) in enumerate(folds_data):
     auc_metric = ROCAUCMetric()
 
     # 🎯 Parámetros
-    max_epochs = 350
+    max_epochs = 200
     val_interval = 1
     best_metric = -1
     best_metric_epoch = -1
@@ -437,7 +442,7 @@ all_test_indices = [idx for _, _, test_idx in folds_data for idx in test_idx]
 unique_test_indices = sorted(list(set(all_test_indices)))
 
 test_image_files = [image_files_list[i] for i in unique_test_indices]
-test_y_binary = binary_labels[unique_test_indices]
+test_y_binary = binary_labels_full[unique_test_indices]
 
 test_ds = CustomDataset(test_image_files, test_y_binary, transforms=val_transforms)
 test_loader = DataLoader(test_ds, batch_size=32, shuffle=False, num_workers=4)
